@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -8,6 +9,8 @@ import (
 	"code.cloudfoundry.org/go-loggregator/rpc/loggregator_v2"
 	"github.com/emirpasic/gods/trees/avltree"
 	"github.com/emirpasic/gods/utils"
+	"github.com/golang/protobuf/proto"
+	"github.com/tecbot/gorocksdb"
 )
 
 // Metrics is the client used for initializing counter and gauge metrics.
@@ -55,10 +58,26 @@ type Store struct {
 	setStoreSize   func(value float64)
 
 	p Pruner
+
+	db *gorocksdb.DB
 }
 
 // NewStore creates a new store.
-func NewStore(maxPerSource, min int, p Pruner, m Metrics) *Store {
+func NewStore(maxPerSource, min int, p Pruner, m Metrics, withDB ...bool) *Store {
+	var db *gorocksdb.DB
+	var err error
+	if len(withDB) == 0 {
+		bbto := gorocksdb.NewDefaultBlockBasedTableOptions()
+		bbto.SetBlockCache(gorocksdb.NewLRUCache(3 << 30))
+		opts := gorocksdb.NewDefaultOptions()
+		opts.SetBlockBasedTableFactory(bbto)
+		opts.SetCreateIfMissing(true)
+		db, err = gorocksdb.OpenDb(opts, "/home/pivotal/workspace/log-cache-release/db")
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	return &Store{
 		maxPerSource:    maxPerSource,
 		p:               p,
@@ -72,7 +91,68 @@ func NewStore(maxPerSource, min int, p Pruner, m Metrics) *Store {
 		incIngress:     m.NewCounter("Ingress"),
 		incEgress:      m.NewCounter("Egress"),
 		setStoreSize:   m.NewGauge("StoreSize"),
+		db:             db,
 	}
+}
+
+func (s *Store) PutDB(e *loggregator_v2.Envelope, index string) {
+	data, err := proto.Marshal(e)
+	if err != nil {
+		panic(err)
+	}
+
+	key := []byte(fmt.Sprintf("%s:%d", index, e.Timestamp))
+	wo := gorocksdb.NewDefaultWriteOptions()
+	s.db.Put(wo, key, data)
+}
+
+func (s *Store) PutDBBatch(es []*loggregator_v2.Envelope) {
+	wo := gorocksdb.NewDefaultWriteOptions()
+	wb := gorocksdb.NewWriteBatch()
+
+	for _, e := range es {
+		key := []byte(fmt.Sprintf("%s:%d", e.SourceId, e.Timestamp))
+		data, err := proto.Marshal(e)
+		if err != nil {
+			panic(err)
+		}
+
+		wb.Put(key, data)
+	}
+
+	s.db.Write(wo, wb)
+}
+
+func (s *Store) GetDB(index string, limit int) []*loggregator_v2.Envelope {
+	ro := gorocksdb.NewDefaultReadOptions()
+	ro.SetFillCache(false)
+	it := s.db.NewIterator(ro)
+	defer it.Close()
+
+	var envs []*loggregator_v2.Envelope
+	it.Seek([]byte(index))
+	i := 0
+	for it = it; it.Valid(); it.Next() {
+		if i == limit {
+			break
+		}
+
+		value := it.Value()
+		data := value.Data()
+
+		var env loggregator_v2.Envelope
+		err := proto.Unmarshal(data, &env)
+		if err != nil {
+			panic(err)
+		}
+
+		envs = append(envs, &env)
+		value.Free()
+
+		i += 1
+	}
+
+	return envs
 }
 
 // Put adds a batch of envelopes into the store.
@@ -141,6 +221,10 @@ func (s *Store) Put(e *loggregator_v2.Envelope, index string) {
 		m.OldestTimestamp = t.Left().Key.(int64)
 		s.meta[index] = m
 	}
+}
+
+func (s *Store) Close() {
+	s.db.Close()
 }
 
 // truncate removes the oldest envelope from the entire cache. It considers

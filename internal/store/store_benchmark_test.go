@@ -59,9 +59,9 @@ func BenchmarkStoreWriteParallel(b *testing.B) {
 }
 
 func BenchmarkStoreGetTime5MinRange(b *testing.B) {
-	s := store.NewStore(StoreSize, StoreSize, &staticPruner{}, nopMetrics{})
+	s := store.NewStore(StoreSize, StoreSize, &staticPruner{}, nopMetrics{}, false)
 
-	for i := 0; i < StoreSize/10; i++ {
+	for i := 0; i < StoreSize; i++ {
 		e := gen()
 		s.Put(e, e.GetSourceId())
 	}
@@ -72,10 +72,11 @@ func BenchmarkStoreGetTime5MinRange(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		results = s.Get(sourceIDs[i%len(sourceIDs)], fiveMinAgo, now, nil, b.N, false)
 	}
+	fmt.Println(len(results))
 }
 
 func BenchmarkStoreGetLogType(b *testing.B) {
-	s := store.NewStore(StoreSize, StoreSize, &staticPruner{}, nopMetrics{})
+	s := store.NewStore(StoreSize, StoreSize, &staticPruner{}, nopMetrics{}, false)
 
 	for i := 0; i < StoreSize/10; i++ {
 		e := gen()
@@ -159,10 +160,10 @@ func contextIsDone(ctx context.Context) bool {
 func randEnvGen() func() *loggregator_v2.Envelope {
 	var s []*loggregator_v2.Envelope
 	fiveMinAgo := time.Now().Add(-5 * time.Minute)
-	for i := 0; i < 10000; i++ {
+	for i := 0; i < 5000000; i++ {
 		s = append(s, benchBuildLog(
 			fmt.Sprintf("%d", i%len(sourceIDs)),
-			fiveMinAgo.Add(time.Duration(i)*time.Millisecond).UnixNano(),
+			fiveMinAgo.Add(time.Duration(i)*time.Nanosecond).UnixNano(),
 		))
 	}
 
