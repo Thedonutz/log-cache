@@ -173,12 +173,17 @@ func (s *Store) Put(e *loggregator_v2.Envelope, index string) {
 // truncate removes the oldest envelope from the entire cache. It considers
 // each source-id.
 func (s *Store) truncate() {
+	startLock := time.Now()
 	prune := s.p.Prune()
+	elapsedLock := time.Now().Sub(startLock)
+	if elapsedLock > time.Millisecond {
+		log.Printf("Prune() was consulted for %s", elapsedLock.String())
+	}
 
 	if prune > 0 {
 		log.Printf("Calling truncate() for %d entries", prune)
 	}
-	
+
 	for i := 0; i < prune; i++ {
 		// Prevent the whole cache from being pruned
 		if s.count <= s.min {
