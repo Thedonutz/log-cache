@@ -37,7 +37,8 @@ type LockTree struct {
 // are thread safe. The Pruner is used to know when entries should be
 // pruned.
 type Store struct {
-	metaMu           sync.RWMutex
+	mapMutex     sync.RWMutex
+	metaMapMutex sync.RWMutex
 	maxPerSource int
 
 	indexes map[string]*LockTree
@@ -85,17 +86,20 @@ func NewStore(maxPerSource, min int, p Pruner, m Metrics) *Store {
 func (s *Store) Put(e *loggregator_v2.Envelope, index string) {
 	s.incIngress(1)
 
-	s.metaMu.Lock()
+	// TODO - does this use justify a RW lock?
+	s.mapMutex.RLock()
 	t, ok := s.indexes[index]
+	s.mapMutex.RUnlock()
 
 	if !ok {
+		s.mapMutex.Lock()
 		t = &LockTree{tree: avltree.NewWith(utils.Int64Comparator)}
 		s.indexes[index] = t
+		s.mapMutex.Unlock()
 
 		// Store the tree for pruning purposes.
 		s.oldestValueTree.Put(e.Timestamp, t.tree)
 	}
-	s.metaMu.Unlock()
 
 	startLock := time.Now()
 	t.Lock()
@@ -114,6 +118,8 @@ func (s *Store) Put(e *loggregator_v2.Envelope, index string) {
 		hasOldest = true
 	}
 
+	s.metaMapMutex.Lock()
+	defer s.metaMapMutex.Unlock()
 	preSize := t.tree.Size()
 
 	if preSize >= s.maxPerSource {
@@ -123,16 +129,12 @@ func (s *Store) Put(e *loggregator_v2.Envelope, index string) {
 		s.incExpired(1)
 
 		// Update the meta
-		s.metaMu.Lock()
 		m := s.meta[index]
 		m.Expired++
 		s.meta[index] = m
-		s.metaMu.Unlock()
 	}
 
 	t.tree.Put(e.Timestamp, envelopeWrapper{e: e, index: index})
-
-	s.metaMu.Lock()
 
 	// Only increment if we didn't overwrite.
 	s.count += t.tree.Size() - preSize
@@ -161,7 +163,6 @@ func (s *Store) Put(e *loggregator_v2.Envelope, index string) {
 		m.OldestTimestamp = t.tree.Left().Key.(int64)
 		s.meta[index] = m
 	}
-	s.metaMu.Unlock()
 
 	elapsedLock = time.Now().Sub(startLock)
 	if elapsedLock > time.Millisecond {
@@ -173,6 +174,11 @@ func (s *Store) Put(e *loggregator_v2.Envelope, index string) {
 // each source-id.
 func (s *Store) truncate() {
 	prune := s.p.Prune()
+
+	if prune > 0 {
+		log.Printf("Calling truncate() for %d entries", prune)
+	}
+	
 	for i := 0; i < prune; i++ {
 		// Prevent the whole cache from being pruned
 		if s.count <= s.min {
@@ -224,9 +230,9 @@ func (s *Store) Get(
 	limit int,
 	descending bool,
 ) []*loggregator_v2.Envelope {
-	s.metaMu.RLock()
+	s.mapMutex.RLock()
 	t, ok := s.indexes[index]
-	s.metaMu.RUnlock()
+	s.mapMutex.RUnlock()
 	if !ok {
 		return nil
 	}
@@ -354,8 +360,8 @@ func (s *Store) checkEnvelopeType(e *loggregator_v2.Envelope, t logcache_v1.Enve
 // Meta returns each source ID tracked in the store.
 func (s *Store) Meta() map[string]logcache_v1.MetaInfo {
 	meta := make(map[string]logcache_v1.MetaInfo)
-	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
+	s.metaMapMutex.Lock()
+	defer s.metaMapMutex.Unlock()
 
 	// Copy the map so that we don't leak the lock protected map beyond the
 	// locks.
