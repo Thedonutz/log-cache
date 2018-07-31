@@ -203,18 +203,8 @@ func (store *Store) truncate() {
 func (store *Store) removeOldestEnvelope() {
 	oldestTimestamp, treeToPrune := store.expirationIndex.RemoveLeftTree()
 
-	// TODO: we should never need this
-	if treeToPrune == nil {
-		return
-	}
-
 	treeToPrune.Lock()
 	defer treeToPrune.Unlock()
-
-	// TODO: is this still a viable code path?
-	if treeToPrune.Size() == 0 {
-		return
-	}
 
 	atomic.AddInt64(&store.count, -1)
 	store.incExpired(1)

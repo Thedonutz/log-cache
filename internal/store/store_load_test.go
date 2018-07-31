@@ -25,13 +25,14 @@ var _ = Describe("store under high concurrent load", func() {
 		start := time.Now()
 
 		// 10 writers per sourceId, 10k envelopes per writer
-		for sourceId := 0; sourceId < 2; sourceId++ {
-			for writers := 0; writers < 1; writers++ {
+		var sourceId, writers, envelopes int
+		for sourceId = 0; sourceId < 10; sourceId++ {
+			for writers = 0; writers < 10; writers++ {
 				wg.Add(1)
 				go func(sourceId string) {
 					defer wg.Done()
 
-					for envelopes := 0; envelopes < 10000; envelopes++ {
+					for envelopes = 0; envelopes < 10000; envelopes++ {
 						e := buildTypedEnvelope(time.Now().UnixNano(), sourceId, &loggregator_v2.Log{})
 						loadStore.Put(e, sourceId)
 						time.Sleep(10 * time.Microsecond)
@@ -51,7 +52,7 @@ var _ = Describe("store under high concurrent load", func() {
 
 		go func() {
 			wg.Wait()
-			fmt.Printf("Finished writing 1M envelopes in %s\n", time.Since(start))
+			fmt.Printf("Finished writing %d  envelopes in %s\n", sourceId*writers*envelopes, time.Since(start))
 			close(done)
 		}()
 
