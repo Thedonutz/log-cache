@@ -14,19 +14,19 @@ import (
 var _ = Describe("store under high concurrent load", func() {
 	timeoutInSeconds := 300
 
-	It("", func(done Done) {
+	FIt("", func(done Done) {
 		var wg sync.WaitGroup
 
 		sp := newSpyPruner()
 		sp.result = 100
 		sm := newSpyMetrics()
 
-		loadStore := store.NewStore(10000, 5000, sp, sm)
+		loadStore := store.NewStore(2500, 4000, sp, sm)
 		start := time.Now()
 
 		// 10 writers per sourceId, 10k envelopes per writer
-		for sourceId := 0; sourceId < 10; sourceId++ {
-			for writers := 0; writers < 10; writers++ {
+		for sourceId := 0; sourceId < 2; sourceId++ {
+			for writers := 0; writers < 1; writers++ {
 				wg.Add(1)
 				go func(sourceId string) {
 					defer wg.Done()
@@ -57,7 +57,9 @@ var _ = Describe("store under high concurrent load", func() {
 
 		Consistently(func() int64 {
 			envelopes := loadStore.Get("index-9", start, time.Now(), nil, 100000, false)
+			fmt.Println("GetCount() =", loadStore.GetCount(), "CountEnvelopes() =", loadStore.CountEnvelopes())
 			return int64(len(envelopes))
 		}, timeoutInSeconds).Should(BeNumerically("<=", 10000))
+
 	}, float64(timeoutInSeconds))
 })
