@@ -47,7 +47,7 @@ var _ = Describe("Store", func() {
 			Expect(e.SourceId).To(Equal("a"))
 		}
 
-		Expect(sm.values["Expired"]).To(Equal(0.0))
+		Expect(sm.values["Expired"]).To(Equal(2.0))
 	})
 
 	It("returns a maximum number of envelopes in ascending order", func() {
@@ -107,11 +107,11 @@ var _ = Describe("Store", func() {
 
 	DescribeTable("fetches data based on envelope type",
 		func(envelopeType logcache_v1.EnvelopeType, envelopeWrapper interface{}) {
-			e1 := buildTypedEnvelope(0, "a", &loggregator_v2.Log{})
-			e2 := buildTypedEnvelope(1, "a", &loggregator_v2.Counter{})
-			e3 := buildTypedEnvelope(2, "a", &loggregator_v2.Gauge{})
-			e4 := buildTypedEnvelope(3, "a", &loggregator_v2.Timer{})
-			e5 := buildTypedEnvelope(4, "a", &loggregator_v2.Event{})
+			e1 := buildTypedEnvelope(1, "a", &loggregator_v2.Log{})
+			e2 := buildTypedEnvelope(2, "a", &loggregator_v2.Counter{})
+			e3 := buildTypedEnvelope(3, "a", &loggregator_v2.Gauge{})
+			e4 := buildTypedEnvelope(4, "a", &loggregator_v2.Timer{})
+			e5 := buildTypedEnvelope(5, "a", &loggregator_v2.Event{})
 
 			s.Put(e1, e1.GetSourceId())
 			s.Put(e2, e2.GetSourceId())
@@ -169,19 +169,19 @@ var _ = Describe("Store", func() {
 	It("truncates older envelopes when max size is reached", func() {
 		s = store.NewStore(10, 5, sp, sm)
 		// e1 should be truncated and sourceID "b" should be forgotten.
-		e1 := buildTypedEnvelope(0, "b", &loggregator_v2.Log{})
+		e1 := buildTypedEnvelope(1, "b", &loggregator_v2.Log{})
 		// e2 should be truncated.
-		e2 := buildTypedEnvelope(1, "a", &loggregator_v2.Counter{})
+		e2 := buildTypedEnvelope(2, "a", &loggregator_v2.Counter{})
 
 		// e3-e7 should be available
-		e3 := buildTypedEnvelope(2, "a", &loggregator_v2.Gauge{})
-		e4 := buildTypedEnvelope(3, "a", &loggregator_v2.Timer{})
-		e5 := buildTypedEnvelope(4, "a", &loggregator_v2.Event{})
-		e6 := buildTypedEnvelope(5, "a", &loggregator_v2.Event{})
-		e7 := buildTypedEnvelope(6, "a", &loggregator_v2.Event{})
+		e3 := buildTypedEnvelope(3, "a", &loggregator_v2.Gauge{})
+		e4 := buildTypedEnvelope(4, "a", &loggregator_v2.Timer{})
+		e5 := buildTypedEnvelope(5, "a", &loggregator_v2.Event{})
+		e6 := buildTypedEnvelope(6, "a", &loggregator_v2.Event{})
+		e7 := buildTypedEnvelope(7, "a", &loggregator_v2.Event{})
 
 		// e8 should be truncated even though it is late
-		e8 := buildTypedEnvelope(0, "a", &loggregator_v2.Event{})
+		e8 := buildTypedEnvelope(1, "a", &loggregator_v2.Event{})
 
 		s.Put(e1, e1.GetSourceId())
 		s.Put(e2, e2.GetSourceId())
@@ -202,10 +202,10 @@ var _ = Describe("Store", func() {
 		Expect(envelopes).To(HaveLen(5))
 
 		for i, e := range envelopes {
-			Expect(e.Timestamp).To(Equal(int64(i + 2)))
+			Expect(e.Timestamp).To(Equal(int64(i + 3)))
 		}
 
-		Expect(sm.values["Expired"]).To(Equal(3.0))
+		Expect(sm.values["Expired"]).To(Equal(5.0))
 		Expect(sm.values["StoreSize"]).To(Equal(5.0))
 
 		// Ensure b was removed fully
@@ -217,11 +217,11 @@ var _ = Describe("Store", func() {
 	It("truncates envelopes for a specific source-id if its max size is reached", func() {
 		s = store.NewStore(2, 2, sp, sm)
 		// e1 should not be truncated
-		e1 := buildTypedEnvelope(0, "b", &loggregator_v2.Log{})
+		e1 := buildTypedEnvelope(1, "b", &loggregator_v2.Log{})
 		// e2 should be truncated
-		e2 := buildTypedEnvelope(1, "a", &loggregator_v2.Log{})
-		e3 := buildTypedEnvelope(2, "a", &loggregator_v2.Log{})
-		e4 := buildTypedEnvelope(3, "a", &loggregator_v2.Log{})
+		e2 := buildTypedEnvelope(2, "a", &loggregator_v2.Log{})
+		e3 := buildTypedEnvelope(3, "a", &loggregator_v2.Log{})
+		e4 := buildTypedEnvelope(4, "a", &loggregator_v2.Log{})
 
 		s.Put(e1, e1.GetSourceId())
 		s.Put(e2, e2.GetSourceId())
@@ -232,13 +232,13 @@ var _ = Describe("Store", func() {
 		end := time.Unix(0, 9999)
 		envelopes := s.Get("a", start, end, nil, 10, false)
 		Expect(envelopes).To(HaveLen(2))
-		Expect(envelopes[0].Timestamp).To(Equal(int64(2)))
-		Expect(envelopes[1].Timestamp).To(Equal(int64(3)))
+		Expect(envelopes[0].Timestamp).To(Equal(int64(3)))
+		Expect(envelopes[1].Timestamp).To(Equal(int64(4)))
 
 		envelopes = s.Get("b", start, end, nil, 10, false)
 		Expect(envelopes).To(HaveLen(1))
 
-		Expect(sm.GetValue("Expired")).To(Equal(1.0))
+		Expect(sm.GetValue("Expired")).To(Equal(3.0))
 	})
 
 	It("sets (via metrics) the store's period in milliseconds", func() {
@@ -264,17 +264,17 @@ var _ = Describe("Store", func() {
 		s = store.NewStore(2, 2, sp, sm)
 
 		// Will be pruned by pruner
-		s.Put(buildTypedEnvelope(0, "index-0", &loggregator_v2.Log{}), "index-0")
-		s.Put(buildTypedEnvelope(1, "index-1", &loggregator_v2.Log{}), "index-1")
+		s.Put(buildTypedEnvelope(1, "index-0", &loggregator_v2.Log{}), "index-0")
+		s.Put(buildTypedEnvelope(2, "index-1", &loggregator_v2.Log{}), "index-1")
 
 		// Timestamp 2 should be pruned as we exceed the max per source of 2.
-		s.Put(buildTypedEnvelope(2, "index-2", &loggregator_v2.Log{}), "index-2")
 		s.Put(buildTypedEnvelope(3, "index-2", &loggregator_v2.Log{}), "index-2")
 		s.Put(buildTypedEnvelope(4, "index-2", &loggregator_v2.Log{}), "index-2")
+		s.Put(buildTypedEnvelope(5, "index-2", &loggregator_v2.Log{}), "index-2")
 
-		// Prune first 2 entries (timestamp 0 and 1)
+		// Prune first 2 entries (timestamp 1 and 2)
 		sp.result = 2
-		s.Put(buildTypedEnvelope(5, "index-1", &loggregator_v2.Log{}), "index-1")
+		s.Put(buildTypedEnvelope(6, "index-1", &loggregator_v2.Log{}), "index-1")
 
 		meta := s.Meta()
 
@@ -283,27 +283,27 @@ var _ = Describe("Store", func() {
 
 		Expect(meta).To(HaveKeyWithValue("index-1", logcache_v1.MetaInfo{
 			Count:           1,
-			Expired:         1,
-			OldestTimestamp: 5,
-			NewestTimestamp: 5,
+			Expired:         2,
+			OldestTimestamp: 6,
+			NewestTimestamp: 6,
 		}))
 
 		Expect(meta).To(HaveKeyWithValue("index-2", logcache_v1.MetaInfo{
 			Count:           2,
-			Expired:         1,
-			OldestTimestamp: 3,
-			NewestTimestamp: 4,
+			Expired:         2,
+			OldestTimestamp: 4,
+			NewestTimestamp: 5,
 		}))
 	})
 
 	It("survives the just added entry from being pruned", func() {
 		s = store.NewStore(2, 2, sp, sm)
 
-		s.Put(buildTypedEnvelope(0, "index-0", &loggregator_v2.Log{}), "index-0")
-		s.Put(buildTypedEnvelope(1, "index-0", &loggregator_v2.Log{}), "index-0")
+		s.Put(buildTypedEnvelope(2, "index-0", &loggregator_v2.Log{}), "index-0")
+		s.Put(buildTypedEnvelope(3, "index-0", &loggregator_v2.Log{}), "index-0")
 
 		sp.result = 1
-		s.Put(buildTypedEnvelope(-1, "index-1", &loggregator_v2.Log{}), "index-1")
+		s.Put(buildTypedEnvelope(1, "index-1", &loggregator_v2.Log{}), "index-1")
 		Expect(s.Meta()).ToNot(HaveKey("index-1"))
 	})
 

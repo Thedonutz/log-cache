@@ -16,8 +16,8 @@ type MetricsInitializer interface {
 	NewGauge(name string) func(value float64)
 }
 
-// Pruner is used to determine if the store should prune.
-type Pruner interface {
+// MemoryConsultant is used to determine if the store should prune.
+type MemoryConsultant interface {
 	// Prune returns the number of envelopes to prune.
 	Prune() int
 }
@@ -40,7 +40,7 @@ type Store struct {
 	maxPerSource int
 
 	metrics Metrics
-	p       Pruner
+	p       MemoryConsultant
 }
 
 type Metrics struct {
@@ -51,7 +51,7 @@ type Metrics struct {
 	setStoreSize   func(value float64)
 }
 
-func NewStore(maxPerSource, minimumStoreSizeToPrune int, p Pruner, m MetricsInitializer) *Store {
+func NewStore(maxPerSource, minimumStoreSizeToPrune int, p MemoryConsultant, m MetricsInitializer) *Store {
 	return &Store{
 		expirationIndex: newIndexTree(),
 
@@ -70,9 +70,7 @@ func NewStore(maxPerSource, minimumStoreSizeToPrune int, p Pruner, m MetricsInit
 	}
 }
 
-func (store *Store) Put(envelope *loggregator_v2.Envelope, sourceId string) {
-	store.metrics.incIngress(1)
-
+func (store *Store) getOrInitializeStorage(sourceId string) *storage {
 	// Hold a lock on the expirationIndex while we check to see if this
 	// will require creation of a new tree
 	store.expirationIndex.Lock()
@@ -80,58 +78,88 @@ func (store *Store) Put(envelope *loggregator_v2.Envelope, sourceId string) {
 
 	if !existingSourceId {
 		envelopeStorage = &storage{Tree: avltree.NewWith(utils.Int64Comparator)}
+		envelopeStorage.(*storage).Put(int64(0), envelopeWrapper{e: nil, index: sourceId})
 		store.storageIndex.Store(sourceId, envelopeStorage.(*storage))
-		store.expirationIndex.PutTree(envelope.Timestamp, envelopeStorage.(*storage))
+		atomic.AddInt64(&store.count, int64(1))
+
+		store.expirationIndex.PutTree(int64(0), envelopeStorage.(*storage))
 	}
 	store.expirationIndex.Unlock()
 
-	envelopeStorage.(*storage).Lock()
+	return envelopeStorage.(*storage)
+}
 
-	var oldestBeforeInsertion int64
+type treeState struct {
+	SizeBeforeInsertion   int
+	SizeAfterInsertion    int
+	OldestBeforeInsertion int64
+	OldestAfterInsertion  int64
+	FreshlyExpired        int
+}
 
-	treeSizeBeforeInsertion := envelopeStorage.(*storage).Size()
-	if treeSizeBeforeInsertion > 0 {
-		oldestBeforeInsertion = envelopeStorage.(*storage).Left().Key.(int64)
+func (storage *storage) insertOrSwap(maxPerSource int, ew envelopeWrapper) treeState {
+	storage.Lock()
+	expired := 0
+
+	oldestBeforeInsertion := storage.Left().Key.(int64)
+	sizeBeforeInsertion := storage.Size()
+
+	if oldestBeforeInsertion == int64(0) || sizeBeforeInsertion >= maxPerSource {
+		storage.Remove(oldestBeforeInsertion)
+
+		expired++
+		storage.meta.Expired++
 	}
 
-	if treeSizeBeforeInsertion >= store.maxPerSource {
-		envelopeStorage.(*storage).Remove(oldestBeforeInsertion)
+	storage.Put(ew.e.Timestamp, ew)
 
-		store.metrics.incExpired(1)
-		envelopeStorage.(*storage).meta.Expired++
+	oldestAfterInsertion := storage.Left().Key.(int64)
+	sizeAfterInsertion := storage.Size()
+	storage.Unlock()
+
+	return treeState{
+		SizeBeforeInsertion:   sizeBeforeInsertion,
+		OldestBeforeInsertion: oldestBeforeInsertion,
+		SizeAfterInsertion:    sizeAfterInsertion,
+		OldestAfterInsertion:  oldestAfterInsertion,
+		FreshlyExpired:        expired,
 	}
+}
 
-	envelopeStorage.(*storage).Put(envelope.Timestamp, envelopeWrapper{e: envelope, index: sourceId})
+func (store *Store) Put(envelope *loggregator_v2.Envelope, sourceId string) {
+	store.metrics.incIngress(1)
+
+	envelopeStorage := store.getOrInitializeStorage(sourceId)
+	ew := envelopeWrapper{e: envelope, index: sourceId}
+	treeState := envelopeStorage.insertOrSwap(store.maxPerSource, ew)
 
 	// Only increment if we didn't overwrite.
-	sizeDiff := int64(envelopeStorage.(*storage).Size() - treeSizeBeforeInsertion)
+	sizeDiff := int64(treeState.SizeAfterInsertion - treeState.SizeBeforeInsertion)
 	atomic.AddInt64(&store.count, sizeDiff)
+	store.metrics.incExpired(uint64(treeState.FreshlyExpired))
 
-	oldestAfterInsertion := envelopeStorage.(*storage).Left().Key.(int64)
-	envelopeStorage.(*storage).Unlock()
-
-	if oldestBeforeInsertion != oldestAfterInsertion && treeSizeBeforeInsertion > 0 {
+	if treeState.OldestBeforeInsertion == int64(0) || treeState.OldestBeforeInsertion > treeState.OldestAfterInsertion {
 		// TODO - this seems like it could be extracted to a method
 		store.expirationIndex.Lock()
-		store.expirationIndex.RemoveTree(oldestBeforeInsertion, envelopeStorage.(*storage))
-		store.expirationIndex.PutTree(oldestAfterInsertion, envelopeStorage.(*storage))
+		store.expirationIndex.RemoveTree(treeState.OldestBeforeInsertion, envelopeStorage)
+		store.expirationIndex.PutTree(treeState.OldestAfterInsertion, envelopeStorage)
 		store.expirationIndex.Unlock()
 	}
 
 	store.truncate()
 	store.metrics.setStoreSize(float64(atomic.LoadInt64(&store.count)))
 
-	envelopeStorage.(*storage).Lock()
-	if envelope.GetTimestamp() > envelopeStorage.(*storage).meta.NewestTimestamp {
-		envelopeStorage.(*storage).meta.NewestTimestamp = envelope.GetTimestamp()
+	envelopeStorage.Lock()
+	if envelope.GetTimestamp() > envelopeStorage.meta.NewestTimestamp {
+		envelopeStorage.meta.NewestTimestamp = envelope.GetTimestamp()
 	}
 
 	// TODO - this logic maybe belongs in truncate() - Put() seems like an odd place
 	// 		to consider that the tree has been deleted during truncate()
-	if envelopeStorage.(*storage).Size() > 0 {
-		envelopeStorage.(*storage).meta.OldestTimestamp = envelopeStorage.(*storage).Left().Key.(int64)
+	if envelopeStorage.Size() > 0 {
+		envelopeStorage.meta.OldestTimestamp = envelopeStorage.Left().Key.(int64)
 	}
-	envelopeStorage.(*storage).Unlock()
+	envelopeStorage.Unlock()
 
 	// TODO - probably a helper
 	oldestValue, oldestTree := store.expirationIndex.LeftTree()
