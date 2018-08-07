@@ -74,6 +74,8 @@ func (store *Store) getOrInitializeStorage(sourceId string) *storage {
 	// Hold a lock on the expirationIndex while we check to see if this
 	// will require creation of a new tree
 	store.expirationIndex.Lock()
+	defer store.expirationIndex.Unlock()
+
 	envelopeStorage, existingSourceId := store.storageIndex.Load(sourceId)
 
 	if !existingSourceId {
@@ -81,10 +83,8 @@ func (store *Store) getOrInitializeStorage(sourceId string) *storage {
 		envelopeStorage.(*storage).Put(int64(0), envelopeWrapper{e: nil, index: sourceId})
 		store.storageIndex.Store(sourceId, envelopeStorage.(*storage))
 		atomic.AddInt64(&store.count, int64(1))
-
 		store.expirationIndex.PutTree(int64(0), envelopeStorage.(*storage))
 	}
-	store.expirationIndex.Unlock()
 
 	return envelopeStorage.(*storage)
 }
@@ -113,6 +113,11 @@ func (storage *storage) insertOrSwap(maxPerSource int, ew envelopeWrapper) treeS
 
 	storage.Put(ew.e.Timestamp, ew)
 
+	if ew.e.Timestamp > storage.meta.NewestTimestamp {
+		storage.meta.NewestTimestamp = ew.e.Timestamp
+	}
+	storage.meta.OldestTimestamp = storage.Left().Key.(int64)
+
 	oldestAfterInsertion := storage.Left().Key.(int64)
 	sizeAfterInsertion := storage.Size()
 	storage.Unlock()
@@ -130,6 +135,8 @@ func (store *Store) Put(envelope *loggregator_v2.Envelope, sourceId string) {
 	store.metrics.incIngress(1)
 
 	envelopeStorage := store.getOrInitializeStorage(sourceId)
+
+	store.expirationIndex.Lock()
 	ew := envelopeWrapper{e: envelope, index: sourceId}
 	treeState := envelopeStorage.insertOrSwap(store.maxPerSource, ew)
 
@@ -138,28 +145,11 @@ func (store *Store) Put(envelope *loggregator_v2.Envelope, sourceId string) {
 	atomic.AddInt64(&store.count, sizeDiff)
 	store.metrics.incExpired(uint64(treeState.FreshlyExpired))
 
-	if treeState.OldestBeforeInsertion == int64(0) || treeState.OldestBeforeInsertion > treeState.OldestAfterInsertion {
-		// TODO - this seems like it could be extracted to a method
-		store.expirationIndex.Lock()
-		store.expirationIndex.RemoveTree(treeState.OldestBeforeInsertion, envelopeStorage)
-		store.expirationIndex.PutTree(treeState.OldestAfterInsertion, envelopeStorage)
-		store.expirationIndex.Unlock()
-	}
+	store.expirationIndex.EnsureOldestTimestamp(treeState.OldestBeforeInsertion, treeState.OldestAfterInsertion, envelopeStorage)
+	store.expirationIndex.Unlock()
 
 	store.truncate()
 	store.metrics.setStoreSize(float64(atomic.LoadInt64(&store.count)))
-
-	envelopeStorage.Lock()
-	if envelope.GetTimestamp() > envelopeStorage.meta.NewestTimestamp {
-		envelopeStorage.meta.NewestTimestamp = envelope.GetTimestamp()
-	}
-
-	// TODO - this logic maybe belongs in truncate() - Put() seems like an odd place
-	// 		to consider that the tree has been deleted during truncate()
-	if envelopeStorage.Size() > 0 {
-		envelopeStorage.meta.OldestTimestamp = envelopeStorage.Left().Key.(int64)
-	}
-	envelopeStorage.Unlock()
 
 	// TODO - probably a helper
 	oldestValue, oldestTree := store.expirationIndex.LeftTree()
@@ -189,7 +179,6 @@ func (store *Store) truncate() {
 
 func (store *Store) removeOldestEnvelope() {
 	store.expirationIndex.Lock()
-
 	oldestTimestamp, treeToPrune := store.expirationIndex.RemoveLeftTree()
 
 	treeToPrune.Lock()
@@ -347,9 +336,9 @@ func (s *Store) checkEnvelopeType(e *loggregator_v2.Envelope, t logcache_v1.Enve
 func (store *Store) Meta() map[string]logcache_v1.MetaInfo {
 	metaReport := make(map[string]logcache_v1.MetaInfo)
 
-	store.storageIndex.Range(func(index interface{}, tree interface{}) bool {
+	store.storageIndex.Range(func(sourceId interface{}, tree interface{}) bool {
 		tree.(*storage).RLock()
-		metaReport[index.(string)] = tree.(*storage).meta
+		metaReport[sourceId.(string)] = tree.(*storage).meta
 		tree.(*storage).RUnlock()
 
 		return true
@@ -357,13 +346,13 @@ func (store *Store) Meta() map[string]logcache_v1.MetaInfo {
 
 	// Range over our local copy of metaReport
 	// TODO - shouldn't we just maintain Count on metaReport..?!
-	for index, meta := range metaReport {
-		tree, _ := store.storageIndex.Load(index)
+	for sourceId, meta := range metaReport {
+		tree, _ := store.storageIndex.Load(sourceId)
 
 		tree.(*storage).RLock()
 		meta.Count = int64(tree.(*storage).Size())
 		tree.(*storage).RUnlock()
-		metaReport[index] = meta
+		metaReport[sourceId] = meta
 	}
 	return metaReport
 }
@@ -386,6 +375,29 @@ func newIndexTree() *index {
 	}
 }
 
+func (index *index) EnsureOldestTimestamp(existingTimestamp, candidateTimestamp int64, envelopeStorage *storage) bool {
+	var expirationsBefore int
+
+	for _, valueArray := range index.Values() {
+		expirationsBefore += len(valueArray.([]*storage))
+	}
+
+	if existingTimestamp == int64(0) || existingTimestamp > candidateTimestamp {
+		index.RemoveTree(existingTimestamp, envelopeStorage)
+		index.PutTree(candidateTimestamp, envelopeStorage)
+
+		var expirationsAfter int
+
+		for _, valueArray := range index.Values() {
+			expirationsAfter += len(valueArray.([]*storage))
+		}
+		return true
+	}
+
+	return false
+}
+
+// NOTE: PutTree should always have a Lock()
 func (index *index) PutTree(key int64, treeToIndex *storage) {
 	var values []*storage
 	if existing, found := index.Get(key); found {
@@ -395,9 +407,11 @@ func (index *index) PutTree(key int64, treeToIndex *storage) {
 	index.Put(key, append(values, treeToIndex))
 }
 
-func (index *index) RemoveTree(key int64, treeToIndex *storage) {
+// NOTE: RemoveTree should always have a Lock()
+func (index *index) RemoveTree(timestamp int64, treeToIndex *storage) {
 	var values []*storage
-	if existing, found := index.Get(key); found {
+
+	if existing, found := index.Get(timestamp); found {
 		values = existing.([]*storage)
 	}
 
@@ -409,14 +423,15 @@ func (index *index) RemoveTree(key int64, treeToIndex *storage) {
 	}
 
 	if len(values) == 0 {
-		index.Remove(key)
+		index.Remove(timestamp)
 		return
 	}
 
-	index.Put(key, values)
+	index.Put(timestamp, values)
 }
 
 // TODO: maybe perhaps consider wrtiting a test for this at some point. maybe.
+// NOTE: RemoveLeftTree should always have a Lock()
 func (index *index) RemoveLeftTree() (int64, *storage) {
 	l := index.Left()
 	timestamp, values := l.Key.(int64), l.Value.([]*storage)
